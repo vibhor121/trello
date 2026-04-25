@@ -1,6 +1,11 @@
+require("dotenv").config();
+const { UserModel, OrganizationModel } = require("./models");
+const mongoose = require("mongoose");
 const express = require("express");
 const jwt = require('jsonwebtoken');
 const { authenticate } = require("./auth");
+
+
 const app = express();
 
 const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key';
@@ -14,107 +19,81 @@ let boards = [];
 let issues = [];
 
 // CREATE
-app.post("/signup",(request,res)=>{
-    const email = request.body.email;
-    const password = request.body.password;
-    if (users.find(u => u.email === email)) {
+app.post("/signup", async (request, res) => {
+    const { username, password } = request.body;
+    const existingUser = await UserModel.findOne({ username });
+    if (existingUser) {
         return res.status(400).json({ error: "User already exists" });
     }
-    const user = { id: users.length + 1, email, password, organization: null };
-    users.push(user);
+    await UserModel.create({ username, password });
     res.json({ message: "User created" });
 });
 
-app.post("/signin", (req, res) => {
-    const { email, password } = req.body;
-    const user = users.find(u => u.email === email && u.password === password);
+app.post("/signin", async (req, res) => {
+    const { username, password } = req.body;
+    const user = await UserModel.findOne({ username, password });
     if (!user) {
         return res.status(401).json({ error: "Invalid credentials" });
     }
-    const token = jwt.sign({ userId: user.id }, JWT_SECRET);
+    const token = jwt.sign({ userId: user._id }, JWT_SECRET);
     res.json({ token });
 });
 
-app.post("/organization", authenticate, (req, res) => {
+app.post("/organization", authenticate, async (req, res) => {
     const { name, title } = req.body;
-    const creatorId = req.userId;
-    const creator = users.find(u => u.id === creatorId);
-    if (!creator) {
-        return res.status(404).json({ error: "Creator not found" });
-    }
-    if (creator.organization) {
-        return res.status(400).json({ error: "User is already part of an organization" });
-    }
-    const org = { id: organizations.length + 1, name, title, members: [creatorId], boards: [] };
-    organizations.push(org);
-    creator.organization = org.id;
-    res.json({ org });
-});
-
-app.get("/organization", authenticate, (req, res) => {
-    const { orgId } = req.query;
     const userId = req.userId;
-    const user = users.find(u => u.id === userId);
-    if (!user) {
-        return res.status(404).json({ error: "User not found" });
-    }
-    if (orgId) {
-        if (user.organization != orgId) {
-            return res.status(403).json({ error: "Not authorized" });
+    const newOrg = await OrganizationModel.create({
+        name,
+        title,
+        admin: userId,
+        members: []
+    });
+    res.json({ message: "Org created", id: newOrg._id });
+});
+
+app.get("/organization", authenticate, async (req, res) => {
+    const { organizationId } = req.query;
+    const userId = req.userId;
+
+    if (organizationId) {
+        const organization = await OrganizationModel.findById(organizationId).populate("members", "username");
+        if (!organization) {
+            return res.status(404).json({ message: "Organization not found" });
         }
-        const org = organizations.find(o => o.id == orgId);
-        if (!org) {
-            return res.status(404).json({ error: "Organization not found" });
+        const isMember = organization.members.some(m => m._id.toString() === userId) || organization.admin.toString() === userId;
+        if (!isMember) {
+            return res.status(403).json({ message: "Not authorized" });
         }
-        const populatedOrg = {
-            ...org,
-            members: org.members.map(id => {
-                const member = users.find(u => u.id === id);
-                return member ? { id: member.id, email: member.email, organization: member.organization } : null;
-            }).filter(Boolean)
-        };
-        res.json({ organization: populatedOrg });
+        res.json({ organization });
     } else {
-        if (!user.organization) {
-            return res.json({ organizations: [] });
-        }
-        const org = organizations.find(o => o.id === user.organization);
-        if (!org) {
-            return res.status(404).json({ error: "Organization not found" });
-        }
-        const populatedOrg = {
-            ...org,
-            members: org.members.map(id => {
-                const member = users.find(u => u.id === id);
-                return member ? { id: member.id, email: member.email, organization: member.organization } : null;
-            }).filter(Boolean)
-        };
-        res.json({ organizations: [populatedOrg] });
+        const organizations = await OrganizationModel.find({
+            $or: [{ members: userId }, { admin: userId }]
+        }).populate("members", "username");
+        res.json({ organizations });
     }
 });
 
-app.post("/add-member-to-organization", authenticate, (req, res) => {
-    const { orgId, email } = req.body;
-    const adderId = req.userId;
-    const org = organizations.find(o => o.id === orgId);
-    if (!org) {
-        return res.status(404).json({ error: "Organization not found" });
+app.post("/add-member-to-organization", authenticate, async (req, res) => {
+    const userId = req.userId;
+    const organizationId = req.body.organizationId;
+    const memberUserUsername = req.body.memberUserUsername;
+
+    const organization = await OrganizationModel.findById(organizationId);
+
+    if (!organization || organization.admin.toString() !== userId) {
+        return res.status(411).json({ message: "Either this org doesnt exist or you are not an admin of this org" });
     }
-    if (!org.members.includes(adderId)) {
-        return res.status(403).json({ error: "Not authorized to add members" });
+
+    const memberUser = await UserModel.findOne({ username: memberUserUsername });
+
+    if (!memberUser) {
+        return res.status(411).json({ message: "No user with this username exists in our db" });
     }
-    const member = users.find(u => u.email === email);
-    if (!member) {
-        return res.status(404).json({ error: "Member not found" });
-    }
-    if (member.organization) {
-        return res.status(400).json({ error: "User is already part of an organization" });
-    }
-    if (!org.members.includes(member.id)) {
-        org.members.push(member.id);
-        member.organization = orgId;
-    }
-    res.json({ org });
+
+    organization.members.push(memberUser._id);
+    await organization.save();
+
+    res.json({ message: "Member added successfully" });
 });
 
 app.post("/board", authenticate, (req, res) => {
@@ -126,7 +105,6 @@ app.post("/board", authenticate, (req, res) => {
     }
     const board = { id: boards.length + 1, name, orgId, issues: [] };
     boards.push(board);
-    org.boards.push(board.id);
     res.json({ board });
 });
 
@@ -172,18 +150,21 @@ app.get("/issues", authenticate, (req, res) => {
     res.json({ issues: boardIssues });
 });
 
-app.get("/members", authenticate, (req, res) => {
-    const { orgId } = req.query;
+app.get("/members", authenticate, async (req, res) => {
+    const orgId = req.query.orgId?.trim();
     const userId = req.userId;
-    if (user.organization != orgId) {
-        return res.status(403).json({ error: "Not authorized" });
-    }
-    const org = organizations.find(o => o.id == orgId);
+
+    const org = await OrganizationModel.findById(orgId).populate("members", "username");
     if (!org) {
         return res.status(404).json({ error: "Organization not found" });
     }
-    const members = users.filter(u => org.members.includes(u.id));
-    res.json({ members });
+
+    const isMember = org.members.some(m => m._id.toString() === userId) || org.admin.toString() === userId;
+    if (!isMember) {
+        return res.status(403).json({ error: "Not authorized" });
+    }
+
+    res.json({ members: org.members });
 });
 
 // UPDATE
@@ -203,25 +184,27 @@ app.put("/issues", authenticate, (req, res) => {
 });
 
 // DELETE
-app.delete("/members", authenticate, (req, res) => {
-    const { orgId, memberId } = req.body;
-    const removerId = req.userId;
-    const user = users.find(u => u.id === removerId);
-    if (!user || user.organization != orgId) {
-        return res.status(403).json({ error: "Not authorized" });
+app.delete("/members", authenticate, async (req, res) => {
+    const { organizationId, memberId } = req.query;
+    const userId = req.userId;
+
+    const organization = await OrganizationModel.findById(organizationId);
+    if (!organization || organization.admin.toString() !== userId) {
+        return res.status(403).json({ message: "Either this org doesnt exist or you are not an admin of this org" });
     }
-    const org = organizations.find(o => o.id == orgId);
-    if (!org) {
-        return res.status(404).json({ error: "Organization not found" });
-    }
-    org.members = org.members.filter(id => id !== memberId);
-    const member = users.find(u => u.id === memberId);
-    if (member) {
-        member.organization = null;
-    }
-    res.json({ message: "Member removed" });
+
+    await OrganizationModel.updateOne({ _id: organizationId }, { $pull: { members: memberId } });
+
+    res.json({ message: "Member removed successfully" });
 });
 
-app.listen(3000, () => {
-    console.log("Server running on port 3000");
-});
+mongoose.connect(process.env.MONGO_URI)
+    .then(() => {
+        console.log("Connected to MongoDB");
+        app.listen(3000, () => {
+            console.log("Server running on port 3000");
+        });
+    })
+    .catch((err) => {
+        console.log("MongoDB connection error:", err);
+    });
